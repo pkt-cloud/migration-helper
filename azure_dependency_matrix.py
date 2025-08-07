@@ -1,7 +1,7 @@
 import json
 import pandas as pd
 
-# Load resources.json (exported using az resource list --output json > resources.json)
+# Load resources.json
 with open('resources.json', 'r') as f:
     resources = json.load(f)
 
@@ -75,13 +75,20 @@ def get_migration_readiness(resource_type):
     else:
         return "Redeploy"
 
-# Parse each resource
+# Parse each resource safely
 for r in resources:
     name = r.get('name', '')
     rtype = r.get('type', '')
     rg = r.get('resourceGroup', '')
     location = r.get('location', '')
-    sku = r.get('sku', {}).get('name') or r.get('properties', {}).get('sku', {}).get('name', 'N/A')
+
+    # Safe SKU extraction
+    sku = (
+        r.get('sku', {}).get('name')
+        if r.get('sku') else
+        (r.get('properties', {}).get('sku', {}).get('name') if r.get('properties') and r.get('properties').get('sku') else "N/A")
+    )
+
     category = get_category(rtype)
     deps = get_dependencies(rtype)
     readiness = get_migration_readiness(rtype)
@@ -97,9 +104,8 @@ for r in resources:
         "MigrationReadiness": readiness
     })
 
-# Create DataFrame
+# Save to CSV
 df = pd.DataFrame(data)
-
-# Export to CSV
 df.to_csv("azure-resource-dependency-matrix.csv", index=False)
+
 print("✅ Dependency matrix exported as 'azure-resource-dependency-matrix.csv'")
