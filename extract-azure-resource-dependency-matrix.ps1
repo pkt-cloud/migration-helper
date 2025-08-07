@@ -1,93 +1,172 @@
-# Set output file name
-$outputFile = "azure-resource-dependency-matrix.csv"
+# Step 1: Set output file name
+$outputFile = "azure-resource-detailed-dependency-matrix.csv"
 
-# Get all resources in the subscription
-Write-Host "Fetching all resources in the current subscription..."
-$resources = az resource list --query "[].{Name:name,Type:type,ResourceGroup:resourceGroup,Id:id}" --output json | ConvertFrom-Json
+# Step 2: Let the user choose a subscription
+Write-Host ""
+Write-Host "Available Azure Subscriptions:"
+Write-Host ""
 
-# Initialize result array
-$dependencyList = @()
+# Get the list of subscriptions
+$subscriptions = az account list --query "[].{Name:name, Id:id}" --output json | ConvertFrom-Json
 
-# Loop through each resource and check ARM dependencies
-foreach ($res in $resources) {
-    $resourceId = $res.Id
-    $resourceName = $res.Name
-    $resourceType = $res.Type
-    $resourceGroup = $res.ResourceGroup
+# Display subscriptions with numbers
+for ($i = 0; $i -lt $subscriptions.Count; $i++) {
+    $number = $i + 1
+    $sub = $subscriptions[$i]
+    Write-Host "$number. $($sub.Name) ($($sub.Id))"
+}
 
-    # Fetch full resource details (including properties)
-    $resourceDetails = az resource show --ids $resourceId --output json | ConvertFrom-Json
+# Ask user to pick a subscription
+do {
+    $selection = Read-Host "Enter the number of the subscription you want to use"
+} while (-not ($selection -as [int]) -or $selection -lt 1 -or $selection -gt $subscriptions.Count)
 
-    # Check for dependsOn (exists in ARM templates, so we need to infer from relationships)
-    $dependsOn = @()
+# Set the selected subscription
+$selectedSub = $subscriptions[$selection - 1]
+az account set --subscription $selectedSub.Id
+Write-Host ""
+Write-Host "Subscription set to: $($selectedSub.Name)"
+Write-Host ""
 
-    # Identify dependencies based on type and properties
-    switch -Wildcard ($resourceType) {
-        "Microsoft.Web/sites" {
-            if ($resourceDetails.properties.serverFarmId) {
-                $dependsOn += "App Service Plan"
-            }
-            if ($resourceDetails.properties.siteConfig?.vnetRouteAll) {
-                $dependsOn += "Virtual Network"
-            }
-            if ($resourceDetails.properties.connectionStrings) {
-                $dependsOn += "Database (SQL/Other)"
-            }
-        }
-        "Microsoft.Web/serverFarms" {
-            $dependsOn += "Virtual Network (ASE) if used"
-        }
-        "Microsoft.Sql/servers/databases" {
-            $dependsOn += "SQL Server"
-            if ($resourceDetails.properties.privateEndpointConnections.Count -gt 0) {
-                $dependsOn += "Virtual Network (Private Endpoint)"
-            }
-        }
-        "Microsoft.Sql/servers" {
-            if ($resourceDetails.properties.privateEndpointConnections.Count -gt 0) {
-                $dependsOn += "Virtual Network (Private Endpoint)"
-            }
-        }
-        "Microsoft.Compute/virtualMachines" {
-            $dependsOn += "Virtual Network, Network Interface, NSG"
-            if ($resourceDetails.properties.storageProfile) {
-                $dependsOn += "Storage Account or Managed Disks"
-            }
-        }
-        "Microsoft.Network/privateEndpoints" {
-            $dependsOn += "Virtual Network, Subnet"
-        }
-        "Microsoft.Network/networkInterfaces" {
-            $dependsOn += "Virtual Network, Subnet"
-        }
-        "Microsoft.Network/networkSecurityGroups" {
-            $dependsOn += "Subnets or Network Interfaces"
-        }
-        "Microsoft.Storage/storageAccounts" {
-            if ($resourceDetails.properties.privateEndpointConnections.Count -gt 0) {
-                $dependsOn += "Virtual Network (Private Endpoint)"
-            }
-        }
-        "Microsoft.KeyVault/vaults" {
-            if ($resourceDetails.properties.privateEndpointConnections.Count -gt 0) {
-                $dependsOn += "Virtual Network (Private Endpoint)"
-            }
-        }
-        default {
-            # No specific dependency logic, leave blank
-        }
-    }
+# Step 3: Get all resources from the subscription
+Write-Host "Fetching all Azure resources..."
+$resources = az resource list --output json | ConvertFrom-Json
+$results = @()
 
-    # Add to dependency list
-    $dependencyList += [PSCustomObject]@{
-        ResourceName  = $resourceName
-        ResourceType  = $resourceType
-        ResourceGroup = $resourceGroup
-        DependsOn     = if ($dependsOn.Count -gt 0) { ($dependsOn -join "; ") } else { "None/Minimal" }
+# Function to classify resources
+function Get-Category($type) {
+    switch -Wildcard ($type) {
+        "*Microsoft.Compute/*" { return "Compute" }
+        "*Microsoft.Web/*" { return "App Services" }
+        "*Microsoft.Sql/*" { return "Database" }
+        "*Microsoft.Network/*" { return "Networking" }
+        "*Microsoft.Storage/*" { return "Storage" }
+        "*Microsoft.KeyVault/*" { return "Security" }
+        "*Microsoft.RecoveryServices/*" { return "Backup & Recovery" }
+        "*Microsoft.OperationalInsights/*" { return "Monitoring" }
+        "*Microsoft.Insights/*" { return "Monitoring" }
+        "*microsoft.insights/*" { return "Monitoring" }
+        "*Microsoft.ServiceBus/*" { return "Messaging" }
+        "*Microsoft.Portal/*" { return "Governance/UX" }
+        "*Microsoft.Security/*" { return "Security" }
+        "*Microsoft.OperationsManagement/*" { return "Monitoring" }
+        default { return "Other" }
     }
 }
 
-# Export to CSV
-$dependencyList | Export-Csv -Path $outputFile -NoTypeInformation
+# Function to detect dependencies
+function Get-Dependencies($type, $details) {
+    $deps = @()
 
-Write-Host "Dependency Matrix exported to $outputFile"
+    if ($type -like "Microsoft.Web/sites") {
+        if ($details.properties.serverFarmId) { $deps += "App Service Plan" }
+        if ($details.properties.connectionStrings) { $deps += "Database (SQL/Other)" }
+    }
+    elseif ($type -like "Microsoft.Web/serverFarms") {
+        $deps += "VNet (if using ASE)"
+    }
+    elseif ($type -like "Microsoft.Sql/servers/databases") {
+        $deps += "SQL Server"
+        if ($details.properties.privateEndpointConnections.Count -gt 0) { $deps += "VNet (Private Endpoint)" }
+    }
+    elseif ($type -like "Microsoft.Sql/servers") {
+        if ($details.properties.privateEndpointConnections.Count -gt 0) { $deps += "VNet (Private Endpoint)" }
+    }
+    elseif ($type -like "Microsoft.Compute/virtualMachines") {
+        $deps += "VNet, NIC, NSG, Disk"
+    }
+    elseif ($type -like "Microsoft.Network/privateEndpoints") {
+        $deps += "VNet, Subnet"
+    }
+    elseif ($type -like "Microsoft.Network/networkInterfaces") {
+        $deps += "VNet, Subnet"
+    }
+    elseif ($type -like "Microsoft.Network/networkSecurityGroups") {
+        $deps += "Subnet/NIC"
+    }
+    elseif ($type -like "Microsoft.Storage/storageAccounts") {
+        if ($details.properties.privateEndpointConnections.Count -gt 0) { $deps += "VNet (Private Endpoint)" }
+    }
+    elseif ($type -like "Microsoft.KeyVault/vaults") {
+        if ($details.properties.privateEndpointConnections.Count -gt 0) { $deps += "VNet (Private Endpoint)" }
+    }
+    elseif ($type -like "Microsoft.ServiceBus/namespaces") {
+        $deps += "VNet (Private Endpoint if enabled)"
+    }
+    else {
+        $deps += "None/Minimal"
+    }
+
+    return ($deps -join "; ")
+}
+
+# Function to determine migration method
+function Get-MigrationReadiness($type) {
+    if ($type -like "Microsoft.Web/sites") { return "Redeploy" }
+    elseif ($type -like "Microsoft.Web/serverFarms") { return "Redeploy" }
+    elseif ($type -like "Microsoft.Sql/servers*") { return "Redeploy" }
+    elseif ($type -like "Microsoft.Storage/storageAccounts") { return "Redeploy" }
+    elseif ($type -like "Microsoft.Compute/virtualMachines") { return "Redeploy" }
+    elseif ($type -like "Microsoft.KeyVault/vaults") { return "Redeploy" }
+    elseif ($type -like "Microsoft.Network/*") { return "Redeploy" }
+    elseif ($type -like "Microsoft.Portal/dashboards") { return "Rebuild" }
+    elseif ($type -like "Microsoft.Insights/*") { return "Rebuild" }
+    elseif ($type -like "Microsoft.RecoveryServices/*") { return "Rebuild" }
+    else { return "Redeploy" }
+}
+
+# Step 4: Loop through resources and gather information
+Write-Host "Analyzing resources..."
+
+foreach ($res in $resources) {
+    $resName = $res.name
+    $resType = $res.type
+    $resGroup = $res.resourceGroup
+    $resId = $res.id
+    $resLocation = $res.location
+    $resSku = "N/A"
+    $lastModified = "Unknown"
+
+    # Get detailed resource info
+    $details = az resource show --ids $resId --output json | ConvertFrom-Json
+
+    # Try to get SKU
+    if ($details.sku -and $details.sku.name) {
+        $resSku = $details.sku.name
+    }
+    elseif ($details.properties -and $details.properties.sku -and $details.properties.sku.name) {
+        $resSku = $details.properties.sku.name
+    }
+
+    # Try to get last modified date
+    if ($details.properties -and $details.properties.lastModifiedTime) {
+        $lastModified = $details.properties.lastModifiedTime
+    }
+    elseif ($details.tags -and $details.tags.LastModified) {
+        $lastModified = $details.tags.LastModified
+    }
+
+    # Categorize, detect dependencies and readiness
+    $category = Get-Category $resType
+    $dependencies = Get-Dependencies $resType $details
+    $migrationPlan = Get-MigrationReadiness $resType
+
+    # Add record
+    $results += [PSCustomObject]@{
+        ResourceName       = $resName
+        ResourceType       = $resType
+        ResourceGroup      = $resGroup
+        Location           = $resLocation
+        SKU                = $resSku
+        LastModifiedDate   = $lastModified
+        Category           = $category
+        DependsOn          = $dependencies
+        MigrationReadiness = $migrationPlan
+    }
+}
+
+# Step 5: Export results to CSV
+Write-Host "Exporting results..."
+$results | Export-Csv -Path $outputFile -NoTypeInformation
+Write-Host ""
+Write-Host "Export complete! File saved as $outputFile"
