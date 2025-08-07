@@ -108,4 +108,4 @@ for r in resources:
 df = pd.DataFrame(data)
 df.to_csv("azure-resource-dependency-matrix.csv", index=False)
 
-print("✅ Dependency matrix exported as 'azure-resource-dependency-matrix.csv'")
+print("Dependency matrix exported as 'azure-resource-dependency-matrix.csv'")
